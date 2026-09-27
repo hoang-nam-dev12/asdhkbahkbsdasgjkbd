@@ -886,7 +886,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
     if (tab == MenuTabESP) {
         addSectionHeader(@(oxorany("Switch")));
         if (menuStyle == 0) {
-            addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP"))], @(oxorany("EnableESP")), NO);
+            addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP"))], @(oxorany("EnableESP")), YES);
             addSwitchRow([self localized:@(oxorany("Line Esp")) viText:@(oxorany("Đường kẻ"))], @(oxorany("Line")), NO);
             addSwitchRow([self localized:@(oxorany("Box Esp")) viText:@(oxorany("Khung ESP"))], @(oxorany("Box")), YES);
             addSwitchRow([self localized:@(oxorany("Info Esp")) viText:@(oxorany("Thông tin"))], @(oxorany("Name")), YES);
@@ -927,7 +927,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             y += boxRow.frame.size.height;
         }
         else {
-            addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP 2 (Lite)"))], @(oxorany("EnableESP2")), NO);
+            addSwitchRow([self localized:@(oxorany("Enable Esp")) viText:@(oxorany("Bật ESP 2 (Lite)"))], @(oxorany("EnableESP2")), YES);
             addSwitchRow([self localized:@(oxorany("Line Esp")) viText:@(oxorany("Đường kẻ"))], @(oxorany("Line")), NO);
             addSwitchRow([self localized:@(oxorany("Box Esp")) viText:@(oxorany("Khung ESP"))], @(oxorany("Box")), YES);
             addSwitchRow([self localized:@(oxorany("Health Esp")) viText:@(oxorany("Thanh Máu"))], @(oxorany("Health")), NO);
@@ -1199,7 +1199,7 @@ typedef NS_ENUM(NSInteger, MenuTab) {
             NSArray *triggerOpts = self.isVietnamese
                 ? @[@(oxorany("Tự động")), @(oxorany("Bắn")), @(oxorany("Ngắm")), @(oxorany("Bắn&Ngắm"))]
                 : @[@(oxorany("Auto")), @(oxorany("Fire")), @(oxorany("Scope")), @(oxorany("Both"))];
-            int trigSel = (int)ESPPrefsFloat(@(oxorany("TriggerMode")), (menuStyle == 1) ? 3.0f : 0.0f);
+            int trigSel = (int)ESPPrefsFloat(@(oxorany("TriggerMode")), 1.0f);
             if (trigSel < 0) trigSel = 0;
             if (trigSel > 3) trigSel = 3;
             UIView *triggerRow = [self createSegmentRowWithTitle:[self localized:@(oxorany("Trigger Mode")) viText:@(oxorany("Kích hoạt"))]
@@ -2070,8 +2070,8 @@ typedef NS_ENUM(NSInteger, MenuTab) {
                 ESPPrefsSetBool(@(oxorany("AimAssist")), NO);
                 ESPPrefsSetBool(@(oxorany("AimBehindWall")), NO);
                 ESPSetAimBehindWallLive(false);
-                // Lite default trigger = Fire&Scope (3). Auto (0) locks cam always.
-                ESPPrefsSetFloat(@(oxorany("TriggerMode")), 3.0f);
+                // Safe default: aim only while the fire button is held.
+                ESPPrefsSetFloat(@(oxorany("TriggerMode")), 1.0f);
 
                 ESPPrefsSetBool(@(oxorany("StreamerMode")), NO);
                 ESPPrefsSetBool(@(oxorany("SpeedX50")), NO);

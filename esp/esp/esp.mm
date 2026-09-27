@@ -2478,8 +2478,22 @@ void ESPSyncFromPrefs(void) {
     // FOV ring visibility (only drawn when Aimbot + sphere FOV mode).
     isShowFovCircle = ESPPrefsBool(@"ShowFovCircle", YES);
 
-    isESP      = ESPPrefsBool(@"EnableESP", YES);
-    isESP2     = ESPPrefsBool(@"EnableESP2", NO);
+    int menuStyle = (int)ESPPrefsFloat(@"MenuLayoutStyle", 0.0f);
+    // Repair installs whose old menu default persisted both ESP modes as OFF.
+    // This migration runs once per menu style; after it, the user can still
+    // turn ESP off normally and the preference is respected.
+    if (AppSettingsObjectForKey(@"ESPOverlayVisibilityFixV1") == nil) {
+        if (menuStyle == 1) {
+            ESPPrefsSetBool(@"EnableESP2", YES);
+        } else {
+            ESPPrefsSetBool(@"EnableESP", YES);
+        }
+        ESPPrefsSetBool(@"Box", YES);
+        AppSettingsSetObject(@"ESPOverlayVisibilityFixV1", @YES);
+    }
+
+    isESP      = ESPPrefsBool(@"EnableESP", menuStyle == 0);
+    isESP2     = ESPPrefsBool(@"EnableESP2", menuStyle == 1);
     isBox      = ESPPrefsBool(@"Box", YES);
     boxMode    = (int)ESPPrefsFloat(@"BoxMode", 0.0f);
     isBone     = ESPPrefsBool(@"Bone", YES);
@@ -2562,7 +2576,13 @@ void ESPSyncFromPrefs(void) {
     if (camPCValue > 150.0f) camPCValue = 150.0f;
 
     aimMode = (int)ESPPrefsFloat(@"AimMode", 1.0f);
-    triggerMode = (int)ESPPrefsFloat(@"TriggerMode", 0.0f);
+    // One-time migration from the old Auto/Fire+Scope defaults.  Aim must not
+    // move the camera until the fire button is actually held.
+    if (AppSettingsObjectForKey(@"AimFireTriggerFixV1") == nil) {
+        ESPPrefsSetFloat(@"TriggerMode", 1.0f); // Fire only
+        AppSettingsSetObject(@"AimFireTriggerFixV1", @YES);
+    }
+    triggerMode = (int)ESPPrefsFloat(@"TriggerMode", 1.0f);
     if (triggerMode < 0) triggerMode = 0;
     if (triggerMode > 3) triggerMode = 3;
     aimPosition = (int)ESPPrefsFloat(@"AimPos", 0.0f);
@@ -2609,7 +2629,6 @@ void ESPSyncFromPrefs(void) {
         s_customNameGlobal = newName;
     }
 
-    int menuStyle = (int)ESPPrefsFloat(@"MenuLayoutStyle", 0.0f);
     if (menuStyle == 1) {
         isEspBot = YES;
         isAimIgnoreBot = NO;
@@ -5194,14 +5213,10 @@ static inline uint64_t ESPPhaseNowUS(void) {
         default: shouldActivate = true; break;                    // Auto
     }
 
-    if (useAssistOnly) {
-        shouldActivate = true; // Aim Assist should assist when near target without waiting for fire
-    }
-
     // Silent (AimSilent.h style): keep a locked target for a high-freq direction-rewrite
     // thread. Camera aim (Aimbot/Assist) stays independent via LookAt.
     const bool cameraAimActive = (isAimbot || useAssist) && shouldActivate;
-    const bool silentActive = useSilent && iAmAlive && isVaildPtr(myPawnObject);
+    const bool silentActive = useSilent && iAmAlive && isVaildPtr(myPawnObject) && shouldActivate;
 
     static int s_aimDiagLog = 0;
     if ((isAimbot || useAssist) && (++s_aimDiagLog % 120 == 1)) {
@@ -5496,11 +5511,11 @@ bool get_IsFiring(uint64_t player) {
 
     // 1) StartFireState enum (when offset is valid).
     int startFire = ReadAddr<int>(player + kIsFiring);
-    if (startFire > 0 && startFire <= 9) {
+    if (StartFireStateIsActive(startFire)) {
         return true;
     }
     int startFireAlt = ReadAddr<int>(player + 0x1C14);
-    if (startFireAlt > 0 && startFireAlt <= 9) {
+    if (StartFireStateIsActive(startFireAlt)) {
         return true;
     }
 

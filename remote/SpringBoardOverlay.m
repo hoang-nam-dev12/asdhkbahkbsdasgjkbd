@@ -59,6 +59,11 @@
 #define SB_DRAW_BONES 0
 
 static BOOL g_sbOverlayOn = NO;
+// Overlay creation can be requested by the boot retry loop and by the render
+// loop at the same time.  Serialise those requests: two concurrent RemoteCall
+// initialisations corrupt the shared session and leave ESP permanently blank.
+static BOOL g_sbStarting = NO;
+static BOOL g_sbRecoveryQueued = NO;
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
@@ -507,11 +512,7 @@ static int sb_open_session(void) {
     return 0;
 }
 
-int SBoardStartOverlay(void) {
-    pthread_mutex_lock(&g_sbLock);
-    if (g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return 0; }
-    pthread_mutex_unlock(&g_sbLock);
-
+static int SBoardStartOverlayImpl(void) {
     if (!g_kexploit_ready) return -1;
 
     NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (extra thread, 15fps)...");
@@ -625,17 +626,51 @@ int SBoardStartOverlay(void) {
         if (g == SB_G_STROKE_MAIN) shape = sh;
     }
 
-    r_msg2_main(win, "setHidden:", 0, 0,0,0);
-
-    uint64_t key = r_sel("fl0rkffESPMenuWindow");
-    if (r_is_objc_ptr(key)) {
-        dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
-    }
-
+    // initWithWindowScene: returns an owned object (+1), so g_sbWin remains
+    // alive for the session without an associated-object call.  The old
+    // objc_setAssociatedObject path was optional but could poison RemoteCall
+    // before the first ESP frame was ever published.
     pthread_mutex_lock(&g_sbLock);
     g_sbWin = win;
     g_sbShape = shape;
     g_sbCanvas = container;
+    pthread_mutex_unlock(&g_sbLock);
+
+    sb_forget_local_paint_state();
+    BOOL rendererReady = YES;
+    for (int g = 0; g < SB_GROUP_COUNT; g++) {
+        if (!persistentPath(g) || !sb_ensure_setpath_invocation(g)) {
+            rendererReady = NO;
+            break;
+        }
+    }
+    if (!ptsBuffer()) rendererReady = NO;
+
+    // Never report a successful overlay when its path publisher failed during
+    // setup.  Previously boot logged success, then every frame returned at the
+    // remote_call_current_success() gate and ESP stayed invisible forever.
+    if (!rendererReady || !remote_call_current_success()) {
+        NSLog(@"[SBOverlay] renderer setup incomplete — scheduling retry");
+        abandon_remote_call();
+        sb_forget_local_paint_state();
+        pthread_mutex_lock(&g_sbLock);
+        g_sbOverlayOn = NO;
+        pthread_mutex_unlock(&g_sbLock);
+        return -1;
+    }
+
+    r_msg2_main(win, "setHidden:", 0, 0,0,0);
+    if (!remote_call_current_success()) {
+        NSLog(@"[SBOverlay] failed to present window — scheduling retry");
+        abandon_remote_call();
+        sb_forget_local_paint_state();
+        pthread_mutex_lock(&g_sbLock);
+        g_sbOverlayOn = NO;
+        pthread_mutex_unlock(&g_sbLock);
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_sbLock);
     g_sbOverlayOn = YES;
     g_sbEverOn = 1;
     g_sbConsecFail = 0;
@@ -645,13 +680,6 @@ int SBoardStartOverlay(void) {
     g_sbRearmAfterUS = 0;
     pthread_mutex_unlock(&g_sbLock);
 
-    sb_forget_local_paint_state();
-    for (int g = 0; g < SB_GROUP_COUNT; g++) {
-        (void)persistentPath(g);
-        (void)sb_ensure_setpath_invocation(g);
-    }
-    (void)ptsBuffer();
-
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
     NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx groups=%d inv=%s @15fps extraThread",
           win, SB_GROUP_COUNT,
@@ -659,21 +687,63 @@ int SBoardStartOverlay(void) {
     return 0;
 }
 
+int SBoardStartOverlay(void) {
+    pthread_mutex_lock(&g_sbLock);
+    if (g_sbOverlayOn) {
+        pthread_mutex_unlock(&g_sbLock);
+        return 0;
+    }
+    if (g_sbStarting) {
+        pthread_mutex_unlock(&g_sbLock);
+        return 1; // another caller is already creating the same overlay
+    }
+    g_sbStarting = YES;
+    pthread_mutex_unlock(&g_sbLock);
+
+    int rc = SBoardStartOverlayImpl();
+
+    pthread_mutex_lock(&g_sbLock);
+    g_sbStarting = NO;
+    pthread_mutex_unlock(&g_sbLock);
+    return rc;
+}
+
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn) {
-        // Rebuild it instead of staying dead. This is the whole fix for the
-        // "ESP paints once and then freezes" report: the old code cleared
-        // g_sbOverlayOn on a single failure and had no path back, so the one
-        // frame that did land stayed on screen for the rest of the session no
-        // matter what happened in the match.
-        if (g_sbEverOn && now_us() > g_sbRearmAfterUS) {
-            g_sbRearmAfterUS = now_us() + 3000000ULL;   // 3s between attempts
-            g_sbConsecFail = 0;
-            if (SBoardStartOverlay() == 0) {
-                NSLog(@"[PUSH-REARM] overlay rebuilt — ESP is live again");
-            } else {
-                NSLog(@"[PUSH-REARM] rebuild failed, retrying");
-            }
+        // Retry even when the overlay has never succeeded.  The old g_sbEverOn
+        // guard meant that four unlucky boot attempts (3/5/8/12 seconds) left
+        // ESP disabled for the entire app lifetime while aim continued working.
+        const uint64_t t = now_us();
+        BOOL queueRecovery = NO;
+        pthread_mutex_lock(&g_sbLock);
+        if (!g_sbOverlayOn && !g_sbStarting && !g_sbRecoveryQueued &&
+            t >= g_sbRearmAfterUS) {
+            g_sbRecoveryQueued = YES;
+            g_sbRearmAfterUS = t + g_sbRearmBackoffUS;
+            queueRecovery = YES;
+        }
+        pthread_mutex_unlock(&g_sbLock);
+
+        if (queueRecovery) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                int rc = SBoardStartOverlay();
+                pthread_mutex_lock(&g_sbLock);
+                g_sbRecoveryQueued = NO;
+                if (rc == 0) {
+                    g_sbRearmBackoffUS = 5000000ULL;
+                    g_sbRearmAfterUS = 0;
+                } else {
+                    uint64_t wait = g_sbRearmBackoffUS;
+                    g_sbRearmAfterUS = now_us() + wait;
+                    g_sbRearmBackoffUS = (wait < 60000000ULL) ? (wait * 2) : 60000000ULL;
+                }
+                pthread_mutex_unlock(&g_sbLock);
+                if (rc == 0) {
+                    NSLog(@"[PUSH-REARM] overlay live — ESP publishing resumed");
+                } else {
+                    NSLog(@"[PUSH-REARM] overlay start failed rc=%d — retry scheduled", rc);
+                }
+            });
         }
         return;
     }
@@ -733,6 +803,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                       (int)remote_call_has_local_state(),
                       (int)remote_call_current_success(),
                       why ? why : "?", remote_call_current_pid());
+                // The watchdog is repairing the current overlay, not asking for
+                // the already-on fast path.  Mark it down and discard the dead
+                // session before starting a fresh one.
+                pthread_mutex_lock(&g_sbLock);
+                g_sbOverlayOn = NO;
+                pthread_mutex_unlock(&g_sbLock);
+                abandon_remote_call();
+                sb_forget_local_paint_state();
                 if (SBoardStartOverlay() == 0) {
                     NSLog(@"[PUSH-REARM] session re-initialised, overlay live");
                 } else {
@@ -834,6 +912,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                     NSLog(@"[PUSH-DEAD] RemoteCall failed %d times in a row — overlay down, will rebuild",
                           g_sbConsecFail);
                     abandon_remote_call();
+                    sb_forget_local_paint_state();
                     pthread_mutex_lock(&g_sbLock);
                     g_sbOverlayOn = NO;
                     pthread_mutex_unlock(&g_sbLock);
